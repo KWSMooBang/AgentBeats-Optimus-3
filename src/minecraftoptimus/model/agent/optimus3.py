@@ -61,7 +61,7 @@ class Optimus3Agent(BaseAgent, ModelHubMixin):
         self,
         policy_ckpt_path: str,
         mllm_model_path: str,
-        task_router_ckpt_path: str = "path_to_task_router/optimus3-task-router",
+        task_router_ckpt_path: str = "/workspace/woosung/AgentBeats-Optimus-3/checkpoint/Optimus-3-Task-Router",
         device="cuda",
     ):
         super().__init__()
@@ -188,7 +188,7 @@ class Optimus3Agent(BaseAgent, ModelHubMixin):
                 "role": "system",
                 "content": self.system_prompt,
             },
-            {"role": "user", "content": [{"type": "text", "text": "How to " + task + " from scratch?"}]},
+            {"role": "user", "content": [{"type": "text", "text": "How to " + task + " from current state?"}]},
         ]
         original_text = self._generate(messages, task_type="plan", max_new_tokens=512)[0]
         output_texts = extract_answer(original_text)
