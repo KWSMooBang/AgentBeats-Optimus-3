@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+import json
 import numpy as np
 import torch
 from PIL import Image
@@ -107,13 +108,13 @@ class Optimus3PurpleAgent:
                 if plan and len(plan) > 0:
                     state.plan = plan
                     state.current_goal = plan[0] if plan else task_text
-                    logger.info("Generated plan: %s", plan)
+                    logger.info("Generated plan:\n%s", json.dumps(plan,  indent=2))
                 else:
                     state.plan = [task_text]
                     state.current_goal = task_text
                     logger.warning("Planning failed, using task directly")
             except Exception as e:
-                logger.exception("Planning error: %s", e)
+                logger.exception("Planning error, using task directly: %s", e)
                 state.plan = [task_text]
                 state.current_goal = task_text
         else:
@@ -147,22 +148,26 @@ class Optimus3PurpleAgent:
             # Get action from model
             action = self._get_action(obs, state.current_goal)
             
-            if action is None:
-                state.idle_count += 1
-                logger.warning("Action is None, idle_count: %d", state.idle_count)
-                
-                # Too many idle frames, try next subtask
-                if state.idle_count > 10 and state.plan:
-                    state.step_index += 1
-                    if state.step_index < len(state.plan):
-                        state.current_goal = state.plan[state.step_index]
-                        state.idle_count = 0
-                        logger.info("Moving to next subtask: %s", state.current_goal)
-                        # Reset with new goal to get new MLLM embed
-                        self.optimus_agent.reset(state.current_goal)
-                        self.current_task = state.current_goal
-                    else:
-                        logger.info("All subtasks completed")
+            if action is None or (action["buttons"] == [0] and action["camera"] == [60]):
+                # Only track idle count and switch subtasks if using planning with multiple subtasks
+                if self.use_planning and state.plan and len(state.plan) > 1:
+                    state.idle_count += 1
+                    logger.info("Action is idle, idle_count: %d", state.idle_count)
+                    
+                    # Too many idle frames, try next subtask
+                    if state.idle_count > 10:
+                        state.step_index += 1
+                        if state.step_index < len(state.plan):
+                            state.current_goal = state.plan[state.step_index]
+                            state.idle_count = 0
+                            logger.info("Moving to next subtask: %s", state.current_goal)
+                            # Reset with new goal to get new MLLM embed
+                            self.optimus_agent.reset(state.current_goal)
+                            self.current_task = state.current_goal
+                        else:
+                            logger.info("All subtasks completed")
+                else:
+                    logger.debug("Action is idle (no planning or single task)")
                 
                 return None, state
             

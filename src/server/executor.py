@@ -7,9 +7,11 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
+from a2a.server.events import EventQueue
 from a2a.server.tasks import TaskUpdater
-from a2a.types import Message, Part, Role, TextPart
-from a2a.utils import new_agent_text_message
+from a2a.types import Message, Part, Role, TextPart, Task, TaskState, InvalidRequestError
+from a2a.utils import new_agent_text_message, new_task
+from a2a.utils.errors import ServerError
 
 from src.agent.agent import Optimus3PurpleAgent, decode_obs, AgentState
 from src.protocol.models import InitPayload, ObservationPayload, ActionPayload, AckPayload
@@ -17,6 +19,14 @@ from src.server.session_manager import SessionManager
 from src.action.action_space import noop_action
 
 logger = logging.getLogger(__name__)
+
+
+TERMINAL_STATES = {
+    TaskState.completed,
+    TaskState.canceled,
+    TaskState.failed,
+    TaskState.rejected
+}
 
 
 class Optimus3Executor(AgentExecutor):
@@ -61,90 +71,105 @@ class Optimus3Executor(AgentExecutor):
         )
         
         # Context-specific states
-        self.agent_states: Dict[str, AgentState] = {}
+        self.agent_states: Dict[Any, AgentState] = {}
         
         logger.info("Optimus3Executor initialized")
     
     async def execute(
         self,
         context: RequestContext,
-        event_queue=None
-    ) -> Message:
+        event_queue: EventQueue
+    ) -> None:
         """
         Process A2A messages
         
         Flow:
-        1. Extract JSON from message
-        2. Branch by type (init/obs)
-        3. Call agent
-        4. Generate response
+        1. Check/create task
+        2. Extract JSON from message
+        3. Branch by type (init/obs)
+        4. Call agent
+        5. Generate response
         
         Args:
             context: Request context with message
             event_queue: Event queue for async operations
-        
-        Returns:
-            Message: Response message
         """
+        # Get message from context
+        msg = context.message
+        if not msg:
+            raise ServerError(error=InvalidRequestError(message="Missing message in request"))
+        
+        # Check if task is already in terminal state
+        task = context.current_task
+        if task and task.status.state in TERMINAL_STATES:
+            raise ServerError(error=InvalidRequestError(
+                message=f"Task {task.id} already processed (state: {task.status.state})"
+            ))
+        
+        # Create task if not exists
+        if not task:
+            task = new_task(msg)
+            await event_queue.enqueue_event(task)
+        
+        # Get IDs from task
+        context_id = task.context_id
+        task_id = task.id
+        
+        # Create task updater
+        updater = TaskUpdater(
+            event_queue=event_queue,
+            task_id=task_id,
+            context_id=context_id,
+        )
+        
+        # Start working
+        await updater.start_work()
+        
         try:
-            # Get message from context
-            msg = getattr(context, "message", None)
+            # Extract text from message
             text = self._extract_text(msg)
-            
-            # Get context IDs
-            context_id = (
-                getattr(msg, "context_id", None) 
-                or getattr(context, "context_id", None)
-                or context.task_id 
-                or context.session_id
-                or "default"
-            )
-            task_id = (
-                getattr(msg, "task_id", None) 
-                or getattr(context, "task_id", None) 
-                or context_id
-            )
-            
-            # Create task updater
-            task_updater = TaskUpdater(
-                event_queue=event_queue,
-                task_id=task_id,
-                context_id=context_id,
-            )
-            
             if not text:
-                return await self._error_response("No text in message", task_updater)
+                await updater.failed(
+                    new_agent_text_message("No text in message", context_id=context_id, task_id=task_id)
+                )
+                return
             
             payload = json.loads(text)
             msg_type = payload.get("type")
             
-            logger.info("Processing message: type=%s, context_id=%s", msg_type, context_id)
+            logger.info("Processing message: context_id=%s, task_id=%s, type=%s", context_id, task_id, msg_type)
             
             if msg_type == "init":
-                return await self._handle_init(payload, context_id, task_updater)
+                await self._handle_init(payload, context_id, updater)
             elif msg_type == "obs":
-                return await self._handle_obs(payload, context_id, task_updater)
+                await self._handle_obs(payload, context_id, updater)
             else:
-                return await self._error_response(f"Unknown type: {msg_type}", task_updater)
+                await updater.failed(
+                    new_agent_text_message(f"Unknown type: {msg_type}", context_id=context_id, task_id=task_id)
+                )
                 
         except Exception as e:
             logger.exception("Execute failed: %s", e)
-            return await self._error_response(str(e), task_updater)
+            await updater.failed(
+                new_agent_text_message(f"Agent error: {str(e)}", context_id=context_id, task_id=task_id)
+            )
     
     async def _handle_init(
         self,
         payload: Dict,
         context_id: str,
         task_updater: TaskUpdater
-    ) -> Message:
+    ) -> None:
         """Handle init message"""
         init = InitPayload(**payload)
         
-        logger.info("Handling init: task=%s", init.text)
+        logger.info("Initialize Task: %s", init.text)
         
         # Create initial state (including planning)
         state = self.agent.initial_state(init.text)
         self.agent_states[context_id] = state
+        
+        logger.info("Create Plan Successfully")
         
         # Ack response
         response = AckPayload(
@@ -152,20 +177,16 @@ class Optimus3Executor(AgentExecutor):
             message=f"Task initialized: {init.text}"
         )
         
-        logger.info("Init successful: plan=%s", state.plan)
-        
         # Complete task
         response_msg = new_agent_text_message(response.model_dump_json())
         await task_updater.complete(message=response_msg)
-        
-        return response_msg
     
     async def _handle_obs(
         self,
         payload: Dict,
         context_id: str,
         task_updater: TaskUpdater
-    ) -> Message:
+    ) -> None:
         """Handle observation message"""
         obs_payload = ObservationPayload(**payload)
         
@@ -174,7 +195,8 @@ class Optimus3Executor(AgentExecutor):
         
         if not state:
             logger.error("No agent initialized for context_id=%s", context_id)
-            return await self._error_response("No agent initialized", task_updater)
+            await task_updater.failed(new_agent_text_message("No agent initialized"))
+            return
         
         logger.debug("Handling obs: step=%d", obs_payload.step)
         
@@ -190,6 +212,8 @@ class Optimus3Executor(AgentExecutor):
         if action is None:
             logger.warning("Action is None, returning noop")
             action = noop_action()
+        else: 
+            logger.debug("Action generated: buttons=%s, camera=%s", action["buttons"], action["camera"])
         
         # Save state
         self.agent_states[context_id] = new_state
@@ -197,15 +221,11 @@ class Optimus3Executor(AgentExecutor):
         # Generate response
         response = ActionPayload(**action)
         
-        logger.debug("Action generated: buttons=%s, camera=%s", action["buttons"], action["camera"])
-        
         # Complete task
         response_msg = new_agent_text_message(response.model_dump_json())
         await task_updater.complete(message=response_msg)
-        
-        return response_msg
     
-    async def cancel(self, context: RequestContext, event_queue=None) -> None:
+    async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         """Cancel handler (no-op for Optimus-3)."""
         logger.warning("Cancel called (no-op)")
         return

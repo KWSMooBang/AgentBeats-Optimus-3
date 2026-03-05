@@ -143,9 +143,9 @@ class Optimus3Agent(BaseAgent, ModelHubMixin):
 
         # input["image"] = resize_numpy_array_pillow(input["image"], (128, 128))
         # input["mllm"] = self.cache_mllm_embed  # [1,1,512]
-        action, _ = self.mine_policy.optimus3_action(self.cache_mllm_embed, input["image"], task=task)
+        minerl_action, agent_action = self.mine_policy.optimus3_action(self.cache_mllm_embed, input["image"], task=task)
 
-        return action, None
+        return agent_action, None
 
     @torch.inference_mode()
     def _generate(

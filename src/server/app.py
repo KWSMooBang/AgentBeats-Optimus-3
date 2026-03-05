@@ -33,8 +33,7 @@ def main():
     parser.add_argument("--task-router", required=True, help="Task router checkpoint path")
     
     parser.add_argument("--device", default="cuda", help="Device (cuda/cpu)")
-    parser.add_argument("--use-planning", action="store_true", default=True, help="Use planning")
-    parser.add_argument("--no-planning", dest="use_planning", action="store_false", help="Disable planning")
+    parser.add_argument("--use-planning", action="store_true", default=False, help="Use planning")
     parser.add_argument("--state-ttl", type=int, default=3600, help="Session TTL in seconds")
     args = parser.parse_args()
     
